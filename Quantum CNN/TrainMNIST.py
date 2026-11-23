@@ -1,222 +1,161 @@
+"""Train the QCNN on MNIST and report predictions."""
+
 import argparse
 import struct
 from pathlib import Path
 
-from UniversalQCNN import Sample, RunUniversalQCNN
+import numpy as np
 
-
-def read_mnist_images(filename):
-    with open(filename, "rb") as f:
-        magic, count, rows, cols = struct.unpack(">IIII", f.read(16))
-
-        if magic != 2051:
-            raise ValueError(f"Invalid MNIST image file: {filename}")
-
-        data = f.read(count * rows * cols)
-
-    images = []
-
-    image_size = rows * cols
-
-    for i in range(count):
-        start = i * image_size
-        end = start + image_size
-
-        image = data[start:end]
-
-        # Convert pixels to floating-point values in [0, 1]
-        features = [pixel / 255.0 for pixel in image]
-
-        images.append(features)
-
-    return images
+from UniversalQCNN import Predict, RunUniversalQCNN, Sample
 
 
 def read_mnist_labels(filename):
-    with open(filename, "rb") as f:
-        magic, count = struct.unpack(">II", f.read(8))
+    with open(filename, "rb") as handle:
+        magic, count = struct.unpack(">II", handle.read(8))
 
         if magic != 2049:
             raise ValueError(f"Invalid MNIST label file: {filename}")
 
-        data = f.read(count)
+        data = np.frombuffer(handle.read(count), dtype=np.uint8)
 
-    return list(data)
+    if data.size != count:
+        raise ValueError(f"MNIST label file is truncated: {filename}")
+
+    return data
 
 
-def load_dataset(images_file, labels_file, limit=None, classes=2):
-    images = read_mnist_images(images_file)
+def read_mnist_images(filename, indices):
+    """Read only the requested records, so --limit does not pay for all 60,000."""
+    with open(filename, "rb") as handle:
+        magic, count, rows, cols = struct.unpack(">IIII", handle.read(16))
+
+        if magic != 2051:
+            raise ValueError(f"Invalid MNIST image file: {filename}")
+
+        size = rows * cols
+        images = np.empty((len(indices), size), dtype=np.uint8)
+
+        for position, index in enumerate(indices):
+            if index < 0 or index >= count:
+                raise ValueError(f"Image index {index} is outside 0..{count - 1}.")
+
+            handle.seek(16 + index * size)
+            record = handle.read(size)
+
+            if len(record) != size:
+                raise ValueError(f"MNIST image file is truncated: {filename}")
+
+            images[position] = np.frombuffer(record, dtype=np.uint8)
+
+    return images / 255.0, rows, cols
+
+
+def downsample(images, rows, cols, qubit_count):
+    """Area-pool each image to a square grid that fits 2^qubit_count amplitudes."""
+    side = max(1, int(np.sqrt(1 << qubit_count)))
+    block = max(1, int(np.ceil(max(rows, cols) / side)))
+    padded_side = side * block
+
+    padded = np.zeros((images.shape[0], padded_side, padded_side))
+    padded[:, :rows, :cols] = images.reshape(-1, rows, cols)
+
+    pooled = padded.reshape(-1, side, block, side, block).mean(axis=(2, 4))
+    return pooled.reshape(images.shape[0], -1)
+
+
+def load_dataset(images_file, labels_file, limit, classes, qubit_count):
     labels = read_mnist_labels(labels_file)
 
-    if len(images) != len(labels):
-        raise ValueError(
-            "Number of images and labels does not match."
-        )
+    keep = np.flatnonzero(labels < classes)
 
-    dataset = []
+    if limit is not None:
+        keep = keep[:limit]
 
-    for features, label in zip(images, labels):
+    if keep.size == 0:
+        raise ValueError("No samples found for the requested classes.")
 
-        # Keep only requested classes
-        if label >= classes:
-            continue
+    images, rows, cols = read_mnist_images(images_file, keep)
+    features = downsample(images, rows, cols, qubit_count)
 
-        dataset.append(
-            Sample(
-                Features=features,
-                Label=int(label)
-            )
-        )
-
-        if limit is not None and len(dataset) >= limit:
-            break
-
-    if not dataset:
-        raise ValueError(
-            "No samples found for the requested classes."
-        )
-
-    return dataset
+    return [
+        Sample(features=features[position], label=int(labels[index]))
+        for position, index in enumerate(keep)
+    ]
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train Universal QCNN on MNIST.")
 
-    parser = argparse.ArgumentParser(
-        description="Train Universal QCNN on MNIST."
-    )
-
+    parser.add_argument("--images", required=True, help="Path to MNIST image file.")
+    parser.add_argument("--labels", required=True, help="Path to MNIST label file.")
+    parser.add_argument("--classes", type=int, default=2, help="Number of classes.")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum number of samples to load.")
     parser.add_argument(
-        "--images",
-        required=True,
-        help="Path to MNIST image file."
-    )
-
-    parser.add_argument(
-        "--labels",
-        required=True,
-        help="Path to MNIST label file."
-    )
-
-    parser.add_argument(
-        "--classes",
+        "--qubits",
         type=int,
-        default=2,
-        help="Number of classes."
+        default=8,
+        help="Qubits to simulate. Higher is exponentially slower.",
     )
-
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Maximum number of samples to load."
+        "--learning-rate", type=float, default=0.1, help="Training learning rate."
     )
-
-    parser.add_argument(
-        "--shots",
-        type=int,
-        default=20,
-        help="Number of quantum shots."
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=10,
-        help="Number of training epochs."
-    )
-
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=0.1,
-        help="Training learning rate."
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed."
-    )
-
-    parser.add_argument(
-        "--run-mode",
-        choices=["local", "cloud"],
-        default="local",
-        help="Quantum execution mode: local Aer or IBM Quantum cloud."
-    )
+    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 
     args = parser.parse_args()
 
-
-
     if not Path(args.images).is_file():
-        raise FileNotFoundError(
-            f"MNIST image file not found: {args.images}"
-        )
-
+        raise FileNotFoundError(f"MNIST image file not found: {args.images}")
     if not Path(args.labels).is_file():
-        raise FileNotFoundError(
-            f"MNIST label file not found: {args.labels}"
-        )
-
+        raise FileNotFoundError(f"MNIST label file not found: {args.labels}")
     if args.classes < 2:
-        raise ValueError(
-            "--classes must be at least 2."
-        )
-
+        raise ValueError("--classes must be at least 2.")
+    if args.qubits < 1:
+        raise ValueError("--qubits must be at least 1.")
     if args.limit is not None and args.limit < 1:
-        raise ValueError(
-            "--limit must be greater than zero."
-        )
-
+        raise ValueError("--limit must be greater than zero.")
 
     print("Loading MNIST dataset...")
 
     dataset = load_dataset(
-        args.images,
-        args.labels,
-        args.limit,
-        args.classes
+        args.images, args.labels, args.limit, args.classes, args.qubits
     )
 
-    print(f"Loaded samples: {len(dataset)}")
-    print(f"Classes: {args.classes}")
-    print(f"Features per sample: {len(dataset[0].Features)}")
-    print(f"Run mode: {args.run_mode}")
-
-
-
+    print(f"Loaded samples : {len(dataset)}")
+    print(f"Classes        : {args.classes}")
+    print(f"Qubits         : {args.qubits}")
+    print(f"Features       : {len(dataset[0].features)}")
+    print(f"Seed           : {args.seed}")
     print()
     print("Starting Universal QCNN training...")
 
     result = RunUniversalQCNN(
         dataset,
         args.classes,
-        args.shots,
+        args.qubits,
         args.epochs,
         args.learning_rate,
-        args.run_mode
+        args.seed,
     )
 
-
     print()
-
     print("Training complete")
-
-
-    print(f"Run mode : {args.run_mode}")
-    print(f"Loss     : {result.loss:.6f}")
-    print(f"Accuracy : {result.accuracy:.4f}")
-    print(f"Epochs   : {result.epochs}")
+    print(f"Loss           : {result.loss:.6f}")
+    print(f"Accuracy       : {result.accuracy:.4f}")
+    print(f"Epochs         : {result.epochs}")
+    print(f"Parameters     : {len(result.parameters)}")
 
     print()
-    print("Final parameters:")
-    print(result.parameters)
+    print("Sample predictions:")
 
-    print()
-    print("QASM circuit exported to:")
-    print("QCNN.qasm")
+    for sample in dataset[:5]:
+        prediction, probabilities = Predict(
+            sample, result.parameters, args.classes, args.qubits
+        )
+        print(
+            f"  P(class {prediction}) = {probabilities[prediction]:.4f} "
+            f"| predicted {prediction} | actual {sample.label}"
+        )
 
 
 if __name__ == "__main__":

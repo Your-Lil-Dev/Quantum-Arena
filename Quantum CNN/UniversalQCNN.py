@@ -1,22 +1,28 @@
-import os
+"""Classical driver for the QCNN.
+
+Every quantum operation lives in src/QCNN.qs. This module prepares inputs,
+reads exact class probabilities out of the Q# simulator, and runs the
+parameter-shift optimizer. No cloud, no sampling, no shot noise.
+"""
+
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
-from dotenv import load_dotenv
-from qiskit import QuantumCircuit, qasm3, transpile
-from qiskit.transpiler import generate_preset_pass_manager
-from qiskit.circuit.library import StatePreparation
-from qiskit_aer import AerSimulator
+from qdk import qsharp
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+qsharp.init(project_root=str(PROJECT_ROOT))
+
+# Loss floor, so a zero probability cannot produce an infinite loss.
+PROBABILITY_FLOOR = 1e-12
 
 
 @dataclass
 class Sample:
-    Features: Sequence[float]
-    Label: int
+    features: np.ndarray
+    label: int
 
 
 @dataclass
@@ -27,406 +33,199 @@ class TrainingResult:
     epochs: int
 
 
-def convolution_parameter_count():
-    return 10
+def _literal(values) -> str:
+    """Format a sequence as a Q# Double[] literal."""
+    return "[" + ", ".join(f"{float(value):.12f}" for value in values) + "]"
 
 
-def pooling_parameter_count():
-    return 6
+class _Simulator:
+    """Keeps one allocated qubit array alive in the Q# interpreter."""
+
+    def __init__(self):
+        self._name = None
+        self._qubit_count = 0
+        self._allocation = 0
+
+    def qubits(self, qubit_count: int) -> str:
+        if qubit_count != self._qubit_count:
+            # The interpreter cannot release a qubit array, and a leftover array
+            # would leak into the state dump and corrupt the probability math,
+            # so a change of size starts a clean interpreter.
+            qsharp.init(project_root=str(PROJECT_ROOT))
+            self._allocation = 1
+            self._name = f"qcnnQubits{self._allocation}"
+            qsharp.eval(f"use {self._name} = Qubit[{qubit_count}];")
+            self._qubit_count = qubit_count
+        return self._name
+
+    def amplitudes(self) -> np.ndarray:
+        return np.asarray(qsharp.dump_machine().as_dense_state(), dtype=complex)
 
 
-def parameter_count_per_block():
-    return 16
+_simulator = _Simulator()
 
 
-def required_qubits(feature_count):
+@lru_cache(maxsize=None)
+def class_qubit_count(class_count: int) -> int:
+    return int(qsharp.eval(f"UniversalQCNN.ClassQubitCount({int(class_count)})"))
+
+
+@lru_cache(maxsize=None)
+def block_parameter_count() -> int:
+    return int(qsharp.eval("UniversalQCNN.BlockParameterCount()"))
+
+
+@lru_cache(maxsize=None)
+def block_count(qubit_count: int, output_qubit_count: int) -> int:
+    return int(
+        qsharp.eval(
+            f"UniversalQCNN.BlockCount({int(qubit_count)}, {int(output_qubit_count)})"
+        )
+    )
+
+
+def minimum_qubits(feature_count: int) -> int:
     if feature_count < 1:
         raise ValueError("Feature count must be greater than zero.")
     return max(1, int(np.ceil(np.log2(feature_count))))
 
 
-def required_class_qubits(class_count):
-    if class_count < 2:
-        raise ValueError("Class count must be at least 2.")
-    return max(1, int(np.ceil(np.log2(class_count))))
+def parameter_count(qubit_count: int, class_count: int) -> int:
+    """Trainable angles needed by a qcnn of this shape."""
+    return block_count(qubit_count, class_qubit_count(class_count)) * block_parameter_count()
 
 
-def number_of_qcnn_blocks(qubit_count, output_qubit_count):
-    if output_qubit_count > qubit_count:
-        raise ValueError("Output qubit count cannot exceed input qubit count.")
-    active = qubit_count
-    blocks = 0
-    while active > output_qubit_count:
-        active = (active + 1) // 2
-        blocks += 1
-    return blocks
+def prepare_input(features, qubit_count: int) -> np.ndarray:
+    """Pad or trim to 2^qubit_count entries and normalise to unit length."""
+    values = np.asarray(features, dtype=float).ravel()
 
-
-def prepare_input(features, qubit_count=None):
-    values = np.asarray(features, dtype=float).flatten()
     if values.size == 0:
         raise ValueError("Features must not be empty.")
-    if qubit_count is None:
-        qubit_count = required_qubits(values.size)
-    dimension = 2 ** qubit_count
+    if values.min() < 0.0:
+        raise ValueError("Amplitude encoding needs non-negative features.")
+
+    dimension = 1 << qubit_count
+
     if values.size > dimension:
         values = values[:dimension]
     elif values.size < dimension:
         values = np.pad(values, (0, dimension - values.size))
+
     norm = np.linalg.norm(values)
-    if norm == 0:
-        values = np.zeros(dimension, dtype=float)
+
+    if norm == 0.0:
+        # An all-zero input has no direction; |0...0> is the defined fallback.
+        values = np.zeros(dimension)
         values[0] = 1.0
-    else:
-        values = values / norm
-    return values
+        return values
+
+    return values / norm
 
 
-def apply_convolution(qc, params, first, second):
-    if len(params) != 10:
-        raise ValueError("Convolution block requires 10 parameters.")
-    qc.ry(params[0], first)
-    qc.rz(params[1], first)
-    qc.ry(params[2], second)
-    qc.rz(params[3], second)
-    qc.cx(first, second)
-    qc.ry(params[4], first)
-    qc.rz(params[5], first)
-    qc.ry(params[6], second)
-    qc.rz(params[7], second)
-    qc.cx(first, second)
-    qc.ry(params[8], first)
-    qc.rz(params[9], second)
+def qubit_order(values, qubit_count: int) -> np.ndarray:
+    """Reorder amplitudes so qubit 0 holds bit 0 of the feature index.
+
+    Q#'s rotation tree splits the array on its first bit, so the amplitude at
+    position i is placed on qubit 0 when i's *most* significant bit is set.
+    Reversing the index bits keeps pixel order intact, so the first block pairs
+    neighbouring pixels instead of opposite halves of the image.
+    """
+    axes = tuple(range(qubit_count - 1, -1, -1))
+    return values.reshape((2,) * qubit_count).transpose(axes).ravel()
 
 
-def apply_pooling(qc, params, survivor, discarded):
-    if len(params) != 6:
-        raise ValueError("Pooling block requires 6 parameters.")
-    qc.ry(params[0], survivor)
-    qc.rz(params[1], survivor)
-    qc.ry(params[2], discarded)
-    qc.rz(params[3], discarded)
-    qc.cx(discarded, survivor)
-    qc.ry(params[4], survivor)
-    qc.rz(params[5], survivor)
-
-
-def apply_block(qc, params, active):
-    if len(params) != 16:
-        raise ValueError("QCNN block requires 16 parameters.")
-    next_active = []
-    convolution_params = params[:10]
-    pooling_params = params[10:]
-    for index in range(0, len(active) - 1, 2):
-        first = active[index]
-        second = active[index + 1]
-        apply_convolution(qc, convolution_params, first, second)
-        apply_pooling(qc, pooling_params, first, second)
-        next_active.append(first)
-    if len(active) % 2:
-        next_active.append(active[-1])
-    for index in range(1, len(active), 2):
-        qc.reset(active[index])
-    return next_active
-
-
-def initialize_parameters(qubit_count, class_count, seed=None):
-    blocks = number_of_qcnn_blocks(
-        qubit_count,
-        required_class_qubits(class_count)
-    )
-    count = blocks * parameter_count_per_block()
-    rng = np.random.default_rng(seed)
-    return rng.uniform(-np.pi, np.pi, count)
-
-
-def build_qcnn(features, parameters, class_count=2):
-    qubit_count = required_qubits(len(features))
-    output_qubits = required_class_qubits(class_count)
-    blocks = number_of_qcnn_blocks(qubit_count, output_qubits)
-    expected = blocks * parameter_count_per_block()
-    parameters = np.asarray(parameters, dtype=float).flatten()
+def class_probabilities(features, parameters, class_count: int, qubit_count: int) -> np.ndarray:
+    parameters = np.asarray(parameters, dtype=float).ravel()
+    expected = parameter_count(qubit_count, class_count)
 
     if parameters.size != expected:
-        raise ValueError(
-            f"Expected {expected} parameters, received {parameters.size}."
-        )
+        raise ValueError(f"Expected {expected} parameters, received {parameters.size}.")
 
-    qc = QuantumCircuit(qubit_count, output_qubits)
-    qc.append(
-        StatePreparation(prepare_input(features, qubit_count).tolist()),
-        list(range(qubit_count))
+    amplitudes = qubit_order(prepare_input(features, qubit_count), qubit_count)
+    output_qubits = class_qubit_count(class_count)
+    qubits = _simulator.qubits(qubit_count)
+
+    active = qsharp.eval(
+        f"UniversalQCNN.Run({_literal(amplitudes)}, {_literal(parameters)}, "
+        f"{output_qubits}, {qubits})"
     )
 
-    active = list(range(qubit_count))
-
-    for block_index in range(blocks):
-        start = block_index * parameter_count_per_block()
-        end = start + parameter_count_per_block()
-        active = apply_block(qc, parameters[start:end], active)
-
-    active = active[:output_qubits]
-
-    for classical_index, qubit in enumerate(active):
-        qc.measure(qubit, classical_index)
-
-    return qc
+    return _marginalise(_simulator.amplitudes(), active, class_count, qubit_count)
 
 
-def export_qasm(qc, filename="QCNN.qasm"):
-    Path(filename).write_text(
-        qasm3.dumps(qc),
-        encoding="utf-8"
-    )
-    return filename
+def _marginalise(amplitudes, active, class_count: int, qubit_count: int) -> np.ndarray:
+    basis = np.arange(amplitudes.size)
+    classes = np.zeros(amplitudes.size, dtype=int)
 
+    for bit, qubit in enumerate(active):
+        # Q#'s state dump stores qubit 0 in the most significant bit.
+        classes |= ((basis >> (qubit_count - 1 - qubit)) & 1) << bit
 
-def get_execution(run_mode):
-    mode = run_mode.lower().strip()
-
-    if mode == "local":
-        return {
-            "mode": "local",
-            "backend": AerSimulator(),
-            "sampler": None
-        }
-
-    if mode == "cloud":
-        from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
-
-        token = os.getenv("IBM_QUANTUM_TOKEN")
-        backend_name = os.getenv("IBM_QUANTUM_BACKEND")
-
-        if not token:
-            raise RuntimeError("IBM_QUANTUM_TOKEN is missing from .env.")
-
-        if not backend_name:
-            raise RuntimeError("IBM_QUANTUM_BACKEND is missing from .env.")
-
-        service = QiskitRuntimeService(
-    channel="ibm_quantum_platform",
-    token=token,
-    instance="Qiskit"
-)
-        backend = service.backend(backend_name)
-        sampler = SamplerV2(mode=backend)
-
-        return {
-            "mode": "cloud",
-            "backend": backend,
-            "sampler": sampler
-        }
-
-    raise ValueError("run_mode must be 'local' or 'cloud'.")
-
-def counts_from_sampler_result(result):
-    pub_result = result[0]
-    data = pub_result.data
-
-    # Your circuit uses the default classical register "c"
-    if hasattr(data, "c"):
-        return data.c.get_counts()
-
-    # Fallback for other register names
-    names = list(data.keys())
-
-    if not names:
-        raise RuntimeError(
-            "IBM Quantum returned no classical-register data."
-        )
-
-    register = getattr(data, names[0])
-
-    if hasattr(register, "get_counts"):
-        return dict(register.get_counts())
-
-    raise RuntimeError(
-        "Could not extract measurement counts from IBM Quantum result."
-    )
-def execute_circuit(qc, execution, shots):
-
-    # ---------------- LOCAL ----------------
-    if execution["mode"] == "local":
-
-        circuit = transpile(
-            qc,
-            execution["backend"],
-            optimization_level=1
-        )
-
-        result = execution["backend"].run(
-            circuit,
-            shots=shots
-        ).result()
-
-        return result.get_counts(circuit)
-
-    # ---------------- CLOUD ----------------
-    if execution["mode"] == "cloud":
-
-        pass_manager = generate_preset_pass_manager(
-            optimization_level=1,
-            backend=execution["backend"]
-        )
-
-        circuit = pass_manager.run(qc)
-
-        job = execution["sampler"].run(
-            [circuit],
-            shots=shots
-        )
-
-        result = job.result()
-
-        return counts_from_sampler_result(result)
-
-    raise ValueError(
-        f"Unknown execution mode: {execution['mode']}"
-    )
-
-def counts_to_probabilities(counts, class_count):
-    probabilities = np.zeros(class_count, dtype=float)
-    total = sum(counts.values())
-
-    if total == 0:
-        return probabilities
-
-    for bit_string, count in counts.items():
-        try:
-            value = int(bit_string.replace(" ", ""), 2)
-        except ValueError:
-            continue
-        if value < class_count:
-            probabilities[value] += count / total
-
+    probabilities = np.zeros(class_count)
+    # Outcomes past the last class (non power-of-two class counts) fold into it.
+    np.add.at(probabilities, np.minimum(classes, class_count - 1), np.abs(amplitudes) ** 2)
     return probabilities
 
 
-def predict_sample(sample, parameters, class_count, execution, shots):
-    circuit = build_qcnn(
-        sample.Features,
-        parameters,
-        class_count
-    )
-    counts = execute_circuit(
-        circuit,
-        execution,
-        shots
-    )
-    probabilities = counts_to_probabilities(
-        counts,
-        class_count
+def predict_sample(sample, parameters, class_count: int, qubit_count: int):
+    probabilities = class_probabilities(
+        sample.features, parameters, class_count, qubit_count
     )
     return int(np.argmax(probabilities)), probabilities
 
 
-def dataset_loss(dataset, parameters, class_count, execution, shots):
+def evaluate(dataset, parameters, class_count: int, qubit_count: int):
+    """Mean loss and accuracy in one pass over the dataset."""
     losses = []
-
-    for sample in dataset:
-        _, probabilities = predict_sample(
-            sample,
-            parameters,
-            class_count,
-            execution,
-            shots
-        )
-        label = int(sample.Label)
-
-        if label < 0 or label >= class_count:
-            raise ValueError(
-                f"Label {label} is outside the class range 0..{class_count - 1}."
-            )
-
-        losses.append(
-            -np.log(max(probabilities[label], 1e-12))
-        )
-
-    return float(np.mean(losses)) if losses else 0.0
-
-
-def dataset_accuracy(dataset, parameters, class_count, execution, shots):
-    if not dataset:
-        return 0.0
-
     correct = 0
 
     for sample in dataset:
-        prediction, _ = predict_sample(
-            sample,
-            parameters,
-            class_count,
-            execution,
-            shots
+        label = int(sample.label)
+
+        if label < 0 or label >= class_count:
+            raise ValueError(f"Label {label} is outside 0..{class_count - 1}.")
+
+        probabilities = class_probabilities(
+            sample.features, parameters, class_count, qubit_count
         )
-        correct += int(prediction == int(sample.Label))
+        losses.append(-np.log(max(probabilities[label], PROBABILITY_FLOOR)))
+        correct += int(int(np.argmax(probabilities)) == label)
 
-    return correct / len(dataset)
+    return float(np.mean(losses)), correct / len(dataset)
 
 
-def train(
-    dataset,
-    class_count,
-    shots,
-    epochs,
-    learning_rate,
-    execution,
-    parameters
-):
+def initialize_parameters(qubit_count: int, class_count: int, seed=None) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.uniform(-np.pi, np.pi, parameter_count(qubit_count, class_count))
+
+
+def train(dataset, class_count, qubit_count, epochs, learning_rate, parameters) -> TrainingResult:
+    if not dataset:
+        raise ValueError("Dataset must not be empty.")
     if epochs < 1:
         raise ValueError("Epochs must be at least 1.")
-    if shots < 1:
-        raise ValueError("Shots must be at least 1.")
     if learning_rate <= 0:
         raise ValueError("Learning rate must be greater than zero.")
 
-    parameters = np.asarray(parameters, dtype=float).copy()
+    parameters = np.array(parameters, dtype=float)
     shift = np.pi / 2
 
     for epoch in range(epochs):
         gradients = np.zeros_like(parameters)
 
-        for index in range(len(parameters)):
+        for index in range(parameters.size):
             plus = parameters.copy()
             minus = parameters.copy()
             plus[index] += shift
             minus[index] -= shift
 
-            loss_plus = dataset_loss(
-                dataset,
-                plus,
-                class_count,
-                execution,
-                shots
-            )
-
-            loss_minus = dataset_loss(
-                dataset,
-                minus,
-                class_count,
-                execution,
-                shots
-            )
+            loss_plus, _ = evaluate(dataset, plus, class_count, qubit_count)
+            loss_minus, _ = evaluate(dataset, minus, class_count, qubit_count)
 
             gradients[index] = 0.5 * (loss_plus - loss_minus)
 
         parameters -= learning_rate * gradients
-
-        loss = dataset_loss(
-            dataset,
-            parameters,
-            class_count,
-            execution,
-            shots
-        )
-
-        accuracy = dataset_accuracy(
-            dataset,
-            parameters,
-            class_count,
-            execution,
-            shots
-        )
+        loss, accuracy = evaluate(dataset, parameters, class_count, qubit_count)
 
         print(
             f"Epoch {epoch + 1}/{epochs} "
@@ -436,98 +235,23 @@ def train(
 
     return TrainingResult(
         parameters=parameters,
-        loss=dataset_loss(
-            dataset,
-            parameters,
-            class_count,
-            execution,
-            shots
-        ),
-        accuracy=dataset_accuracy(
-            dataset,
-            parameters,
-            class_count,
-            execution,
-            shots
-        ),
-        epochs=epochs
+        loss=loss,
+        accuracy=accuracy,
+        epochs=epochs,
     )
 
 
-def RunUniversalQCNN(
-    dataset,
-    classCount,
-    shots,
-    epochs,
-    learningRate,
-    run_mode="local"
-):
+def RunUniversalQCNN(dataset, classCount, qubitCount=None, epochs=10, learningRate=0.1, seed=None):
     if not dataset:
         raise ValueError("Dataset must not be empty.")
 
-    execution = get_execution(run_mode)
-    qubit_count = required_qubits(len(dataset[0].Features))
+    if qubitCount is None:
+        qubitCount = minimum_qubits(len(dataset[0].features))
 
-    parameters = initialize_parameters(
-        qubit_count,
-        classCount
-    )
+    parameters = initialize_parameters(qubitCount, classCount, seed)
 
-    result = train(
-        dataset,
-        classCount,
-        shots,
-        epochs,
-        learningRate,
-        execution,
-        parameters
-    )
-
-    final_circuit = build_qcnn(
-        dataset[0].Features,
-        result.parameters,
-        classCount
-    )
-
-    export_qasm(
-        final_circuit,
-        "QCNN.qasm"
-    )
-
-    return result
+    return train(dataset, classCount, qubitCount, epochs, learningRate, parameters)
 
 
-def TrainModel(
-    dataset,
-    classCount,
-    shots=20,
-    epochs=10,
-    learningRate=0.1,
-    run_mode="local"
-):
-    return RunUniversalQCNN(
-        dataset,
-        classCount,
-        shots,
-        epochs,
-        learningRate,
-        run_mode
-    )
-
-
-def Predict(
-    sample,
-    parameters,
-    classCount,
-    shots=20,
-    run_mode="local"
-):
-    execution = get_execution(run_mode)
-
-    return predict_sample(
-        sample,
-        parameters,
-        classCount,
-        execution,
-        shots
-    )
+def Predict(sample, parameters, classCount, qubitCount):
+    return predict_sample(sample, parameters, classCount, qubitCount)
